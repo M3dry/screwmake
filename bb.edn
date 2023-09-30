@@ -1,0 +1,13 @@
+{:paths ["src"]
+ :deps {}
+ :tasks {:requires ([babashka.fs :as fs] [babashka.process :as p])
+         build (do
+                 (let [script (do
+                                (when-not (fs/directory? "./out")
+                                          (fs/create-dir "./out"))
+                                (fs/delete-if-exists "./out/screwmake")
+                                (p/shell "bb" "uberscript" "./out/screwmake" "-m" "screwmake.app")
+                                (slurp "./out/screwmake"))]
+                  (spit "./out/screwmake" (str "#!/usr/bin/env bb\n" script))
+                  (fs/set-posix-file-permissions "./out/screwmake" "rwxr-xr-x")))
+         clean (fs/delete-tree "./out")}}

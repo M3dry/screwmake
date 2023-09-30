@@ -1,0 +1,182 @@
+#!/usr/bin/env bb
+(ns screwmake.util
+  (:require
+    [babashka.fs :as fs])) 
+
+(defn get-source-files [dir ext]
+  (let [files (map str (fs/list-dir dir))]
+    (-> (filter #(and (not (fs/directory? %))
+                      (= (fs/extension %) ext))
+                files)
+        (concat (map #(get-source-files % ext)
+                     (filter fs/directory?
+                             files)))
+        flatten)))
+
+(def root-files ["bb.edn", ".git", "flake.nix", "screwmake.json"])
+
+(defn root?
+  ([cwd] (root? cwd root-files))
+  ([cwd root-files']
+   (some fs/exists?
+          (map #(fs/file cwd %)
+               root-files'))))
+
+(defn get-root
+  ([] (get-root (fs/cwd)))
+  ([cwd] (get-root cwd root-files))
+  ([cwd root-files']
+   (if (root? cwd root-files')
+       cwd
+       (get-root (fs/parent cwd)))))
+
+(defn absnorm [path]
+  (->> path
+       fs/absolutize
+       fs/normalize))
+
+(defn fileify [& segs]
+  (->> segs
+       (apply fs/file)
+       absnorm
+       str))
+
+(defn create-dirs [& dirs]
+  (dorun
+    (map fs/create-dirs
+         dirs)))
+
+(comment
+  (map (comp println str)
+       (get-source-files (absnorm "./src/")
+                         "clj"))
+  (str (get-root (absnorm "./src")))
+  (create-dirs (map absnorm
+                    ["./abc" "./def/ghj"])))
+(ns screwmake.c 
+  (:refer-clojure :exclude [compile])
+  (:require
+    [babashka.process :as p]
+    [screwmake.util :as util]
+    [babashka.fs :as fs]))
+
+(defn- config-paths [{target :target dirs :dirs :as conf} name root]
+  (let [out' (util/fileify root (:out dirs) name)]
+    (-> conf
+        (assoc :target (util/fileify out' "bin" target))
+        (assoc-in [:dirs :out] out')
+        (assoc-in [:dirs :src]
+                  (util/fileify root
+                                (:src dirs))))))
+
+(defn compile [{cc :cc
+                cflags :cflags}
+               sources
+               outs]
+  (dorun
+    (map (fn [[fst snd]]
+           (apply p/shell
+                  (flatten (list cc "-c" cflags fst "-o" snd))))
+         (zipmap sources
+                 outs))))
+
+(defn link [{cc :cc
+             ldflags :ldflags
+             target :target}
+            objs]
+  (apply p/shell
+         (flatten (list cc ldflags objs "-o" target))))
+
+(defn build
+  "Expects `conf` to be verified by the `make-config` function."
+  [{{out :out src :src} :dirs
+    :as conf}]
+  (let [obj-dir (util/fileify out "obj")
+        sources (util/get-source-files src "c")
+        outs (map #(str (->> src
+                            count
+                            inc
+                            (subs %)
+                            fs/split-ext
+                            first
+                            (util/fileify obj-dir))
+                        ".o")
+                  sources)]
+    (apply util/create-dirs (flatten [obj-dir (util/fileify out "bin") (map fs/parent outs)]))
+    (compile conf sources outs)
+    (link conf outs)
+    (:target conf)))
+
+(defn make-config [{target :target
+                    cc :cc
+                    ldflags :ldflags
+                    cflags :cflags
+                    {out :out
+                     src :src} :dirs
+                    :as conf}
+                   name
+                   root]
+  (cond-> conf
+    (nil? cc) (assoc :cc "gcc")
+    (nil? ldflags) (assoc :ldflags [])
+    (nil? cflags) (assoc :cflags [])
+    (nil? out) (assoc-in [:dirs :out] "./out")
+    (nil? src) (assoc-in [:dirs :src] "./src")
+    (nil? target) (assoc :target name)
+    true (config-paths name root)))
+
+(comment
+  (let [conf (make-config {:cc "clangd"
+                           :cflags ["-Wall", "-g"]
+                           :dirs {:out "./build"
+                                  :src "./app"}
+                           :target "foobaz"}
+                          "foobar"
+                          "/home/m3/projects/foobar")]
+    (build conf)))
+(ns screwmake.app
+  (:require
+   [cheshire.core :as json]
+   [screwmake.c :as c]
+   [screwmake.util :as util]
+   [babashka.fs :as fs]
+   [babashka.process :as p]))
+
+(defn get-config [root]
+  (let [path (util/fileify root "screwmake.json")]
+    (if (fs/exists? path)
+      (json/parse-string (slurp path) true)
+      (do
+        (println "Please create a config file")
+        (System/exit 1)))))
+
+(defn one-of
+  ([is match] (if (vector? is)
+                  (some #(= match %) is)
+                  (= match is))))
+
+(defn -main [project-name cmd & args]
+  (let [root (util/get-root)
+        config (get-config root)
+        {lang :language
+         cmds :commands
+         :as project-config} ((keyword project-name) config)]
+    (condp = lang
+      "C" (if (contains? cmds cmd)
+            (apply p/shell ((keyword cmd) cmds))
+            (let [build-config (c/make-config (:build project-config)
+                                              project-name
+                                              root)]
+              (condp one-of cmd
+                "build"         (c/build build-config)
+                ["exec", "run"] (-> build-config
+                                   c/build
+                                   (list args)
+                                   flatten
+                                   (#(apply p/shell %)))
+                "clean"         (fs/delete-tree (:out (:dirs build-config))))))
+      (do
+        (println (str "Invalid language for project `" project-name "`"))
+        (System/exit 1)))))
+
+(ns user (:require [screwmake.app])) (apply screwmake.app/-main *command-line-args*)
