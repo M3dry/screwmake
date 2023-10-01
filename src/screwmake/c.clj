@@ -3,16 +3,40 @@
   (:require
     [babashka.process :as p]
     [screwmake.util :as util]
+    [screwmake.builder :as b]
     [babashka.fs :as fs]))
+
+(declare config-paths build)
+
+(defrecord Config [target cc cflags ldflags dirs]
+  b/Builder
+    (run [config cmd args]
+      (condp util/one-of cmd
+        "build"        (build config)
+        ["exec" "run"] (-> config
+                           build
+                           (list args)
+                           flatten
+                           (#(apply p/shell %)))
+        "clean"        (fs/delete-tree (:out (:dirs config))))))
+
+(defmethod b/make-config "C" [{config :config} name root]
+  (apply ->Config
+         (-> {:target name
+              :cc "gcc"
+              :cflags []
+              :ldflags []
+              :dirs {:out "./out"
+                     :src "./src"}}
+             (merge config)
+             (config-paths name root)
+             vals)))
 
 (defn- config-paths [{target :target dirs :dirs :as conf} name root]
   (let [out' (util/fileify root (:out dirs) name)]
-    (-> conf
-        (assoc :target (util/fileify out' "bin" target))
-        (assoc-in [:dirs :out] out')
-        (assoc-in [:dirs :src]
-                  (util/fileify root
-                                (:src dirs))))))
+    (assoc conf :target (util/fileify out' "bin" target)
+                :dirs {:out out'
+                       :src (util/fileify root (:src dirs))})))
 
 (defn compile [{cc :cc
                 cflags :cflags}
@@ -33,7 +57,6 @@
          (flatten (list cc ldflags objs "-o" target))))
 
 (defn build
-  "Expects `conf` to be verified by the `make-config` function."
   [{{out :out src :src} :dirs
     :as conf}]
   (let [obj-dir (util/fileify out "obj")
@@ -51,31 +74,3 @@
     (compile conf sources outs)
     (link conf outs)
     (:target conf)))
-
-(defn make-config [{target :target
-                    cc :cc
-                    ldflags :ldflags
-                    cflags :cflags
-                    {out :out
-                     src :src} :dirs
-                    :as conf}
-                   name
-                   root]
-  (cond-> conf
-    (nil? cc) (assoc :cc "gcc")
-    (nil? ldflags) (assoc :ldflags [])
-    (nil? cflags) (assoc :cflags [])
-    (nil? out) (assoc-in [:dirs :out] "./out")
-    (nil? src) (assoc-in [:dirs :src] "./src")
-    (nil? target) (assoc :target name)
-    true (config-paths name root)))
-
-(comment
-  (let [conf (make-config {:cc "clangd"
-                           :cflags ["-Wall", "-g"]
-                           :dirs {:out "./build"
-                                  :src "./app"}
-                           :target "foobaz"}
-                          "foobar"
-                          "/home/m3/projects/foobar")]
-    (build conf)))

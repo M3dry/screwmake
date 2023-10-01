@@ -45,6 +45,11 @@
     (map fs/create-dirs
          dirs)))
 
+(defn one-of
+  ([is match] (if (vector? is)
+                  (some #(= match %) is)
+                  (= match is))))
+
 (comment
   (map (comp println str)
        (get-source-files (absnorm "./src/")
